@@ -144,6 +144,12 @@ async function initSpoke() {
       message: '本机使用的 Agent CLI？',
       choices: ['claude', 'qwen', 'codex', '自定义'],
     },
+    {
+      type: 'input',
+      name: 'backupHubs',
+      message: '备用 Hub 节点名（故障转移顺序，多个用逗号分，留空=仅用在线率选举）',
+      default: '',
+    },
   ]);
 
   // 自动检测网络类型
@@ -157,16 +163,26 @@ async function initSpoke() {
     ));
   }
 
+  const backupHubs = answers.backupHubs
+    ? answers.backupHubs.split(',').map(s => s.trim()).filter(Boolean)
+    : [];
+
   cfg.save({
-    role:     'spoke',
-    name:     answers.name,
-    hubUrl:   answers.hubUrl,
-    hubToken: answers.hubToken,
-    agent:    answers.agent,
+    role:       'spoke',
+    name:       answers.name,
+    hubUrl:     answers.hubUrl,
+    hubToken:   answers.hubToken,
+    agent:      answers.agent,
+    backupHubs,
     netType,
   });
 
   console.log(chalk.bold.green('\n✅  Spoke 配置已保存'));
+  if (backupHubs.length) {
+    console.log(chalk.gray(`  🔄 备用 Hub 顺序: ${backupHubs.join(' → ')} → 在线率选举`));
+  } else {
+    console.log(chalk.gray(`  🔄 无预设备用 Hub，Hub 故障时直接进行在线率选举`));
+  }
   console.log(chalk.gray('  运行 mesh start 连接 Hub\n'));
 }
 

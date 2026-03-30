@@ -27,8 +27,9 @@ const MSG = {
   QUERY:         'query',          // Spoke → Hub：主动询问
   REPORT:        'report',         // Spoke → Hub：主动汇报状态
 
-  // 系统
-  ERROR:         'error',          // 错误通知
+  // 选举（Hub 故障转移）
+  ELECTION_CALL: 'election_call',  // 广播选举邀请（携带自己在线率）
+  ELECTION_WIN:  'election_win',   // 广播自己当选临时 Hub
   NODES_LIST:    'nodes_list',     // Hub → Spoke：当前在线节点列表
 };
 

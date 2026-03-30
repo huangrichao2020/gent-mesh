@@ -1,41 +1,62 @@
 /**
  * core/spoke.js — Spoke 节点客户端
  *
- * 主动连接 Hub，维持心跳，处理任务分发，
- * 流式输出结果。自动检测局域网/公网并给出建议。
+ * 主动连接 Hub，维持心跳，处理任务分发，流式输出结果。
+ * 内置故障转移：Hub 挂了先按预设备用列表切换，全挂了启动在线率选举。
  */
 
 const WebSocket  = require('ws');
 const chalk      = require('chalk');
 const { MSG, createMsg, parseMsg } = require('./message');
 const { detectHubNetwork } = require('./detect');
+const { ElectionManager, UptimeTracker } = require('./election');
 
-const HEARTBEAT_INTERVAL = 20_000;   // 20s 心跳
-const RECONNECT_BASE     = 3_000;    // 初始重连间隔
-const RECONNECT_MAX      = 30_000;   // 最大重连间隔
+const HEARTBEAT_INTERVAL = 20_000;
+const HUB_TIMEOUT_MS     = 60_000;   // 60s 无心跳响应视为 Hub 挂
+const RECONNECT_BASE     = 3_000;
+const RECONNECT_MAX      = 30_000;
 
 class Spoke {
   constructor(cfg) {
-    this.cfg          = cfg;
-    this.name         = cfg.name;
-    this.hubUrl       = cfg.hubUrl;
-    this.token        = cfg.hubToken;
-    this.agentName    = cfg.agent || 'unknown';
+    this.cfg        = cfg;
+    this.name       = cfg.name;
+    this.hubUrl     = cfg.hubUrl;
+    this.token      = cfg.hubToken;
+    this.agentName  = cfg.agent || 'unknown';
 
-    this.ws           = null;
-    this.connected    = false;
-    this.reconnectMs  = RECONNECT_BASE;
-    this._hbTimer     = null;
+    this.ws          = null;
+    this.connected   = false;
+    this.reconnectMs = RECONNECT_BASE;
+    this._hbTimer    = null;
     this._reconnTimer = null;
+    this._hubTimeoutTimer = null;
+    this._lastHubPong = Date.now();
 
-    // 消息处理器 map：type → handler
-    this._handlers    = new Map();
+    // 在线率追踪
+    this._uptime = new UptimeTracker();
+
+    // 选举管理器
+    this._election = new ElectionManager({
+      myName:      this.name,
+      backupHubs:  cfg.backupHubs || [],
+      send:        (msg) => this._send(msg),
+      connectHub:  (name) => this._switchHub(name),
+      uptimeTracker: this._uptime,
+    });
+
+    this._election.on('new-hub', (name) => this._switchHub(name));
+    this._election.on('become-hub', () => this._becomeHub());
+    this._election.on('hub-restored', () => {
+      // 原 Hub 恢复，重新连接原地址
+      this._connect();
+    });
+
+    this._handlers = new Map();
     this._setupDefaultHandlers();
   }
 
   // ── 连接 ──
   async start() {
-    // 检测网络类型
     const netType = await detectHubNetwork(this.hubUrl);
     console.log(chalk.cyan(`  网络类型: ${netType === 'lan' ? '局域网' : '公网'}`));
 
@@ -52,13 +73,11 @@ class Spoke {
 
   _connect() {
     console.log(chalk.gray(`  → 连接 Hub: ${this.hubUrl} ...`));
-
     this.ws = new WebSocket(this.hubUrl);
-
-    this.ws.on('open', () => this._onOpen());
+    this.ws.on('open',    ()    => this._onOpen());
     this.ws.on('message', (raw) => this._onMessage(raw.toString()));
-    this.ws.on('close', () => this._onClose());
-    this.ws.on('error', (err) => {
+    this.ws.on('close',   ()    => this._onClose());
+    this.ws.on('error',   (err) => {
       console.error(chalk.red(`  连接错误: ${err.message}`));
     });
   }
@@ -66,43 +85,120 @@ class Spoke {
   _onOpen() {
     this.connected   = true;
     this.reconnectMs = RECONNECT_BASE;
+    this._uptime.onConnected();
+    this._lastHubPong = Date.now();
 
-    // 注册自己
+    // 注册，携带在线率
     this._send(createMsg(MSG.REGISTER, this.name, 'hub', {
-      name:  this.name,
-      agent: this.agentName,
-      token: this.token,
+      name:       this.name,
+      agent:      this.agentName,
+      token:      this.token,
+      uptimeRate: this._uptime.getRate(),
     }));
 
-    // 启动心跳
+    // 心跳
     this._hbTimer = setInterval(() => {
       this._send(createMsg(MSG.HEARTBEAT, this.name, 'hub'));
     }, HEARTBEAT_INTERVAL);
 
+    // Hub 超时检测
+    this._hubTimeoutTimer = setInterval(() => {
+      const elapsed = Date.now() - this._lastHubPong;
+      if (elapsed > HUB_TIMEOUT_MS) {
+        console.log(chalk.red(`  ⚠️  Hub 心跳超时 (${Math.round(elapsed / 1000)}s)，启动故障转移`));
+        clearInterval(this._hubTimeoutTimer);
+        clearInterval(this._hbTimer);
+        this._election.onHubLost();
+      }
+    }, 10_000);  // 每 10s 检查一次
+
     console.log(chalk.green(`  ✅ 已连接 Hub（节点名: ${this.name}）`));
+    if (this.cfg.backupHubs?.length) {
+      console.log(chalk.gray(`  🔄 备用 Hub: ${this.cfg.backupHubs.join(' → ')}`));
+    }
   }
 
   _onMessage(raw) {
     const msg = parseMsg(raw);
     if (!msg) return;
 
+    // 收到 Hub 任何消息，都刷新最后在线时间
+    if (msg.from === 'hub' || msg.type === MSG.HEARTBEAT_ACK) {
+      this._lastHubPong = Date.now();
+    }
+
+    // 选举相关消息
+    if (msg.type === MSG.ELECTION_CALL) {
+      this._uptime.getRate && this._send(createMsg(MSG.ELECTION_CALL, this.name, '*', {
+        uptimeRate: this._uptime.getRate(),
+      }));
+      this._election.onElectionResponse(msg);
+      return;
+    }
+    if (msg.type === MSG.ELECTION_WIN) {
+      this._election.onElectionWin(msg);
+      return;
+    }
+
+    // Ping 响应（用于备用 Hub 探活）
+    if (msg.type === MSG.QUERY && msg.payload?.ping) {
+      this._send(createMsg(MSG.REPORT, this.name, msg.from, {
+        pong: true,
+        uptimeRate: this._uptime.getRate(),
+      }));
+      return;
+    }
+    if (msg.type === MSG.REPORT && msg.payload?.pong) {
+      this._election.receivePong(msg.from);
+      return;
+    }
+
     const handler = this._handlers.get(msg.type);
     if (handler) handler(msg);
-    else this.emit('message', msg); // 透传给上层
+    else this.emit('message', msg);
   }
 
   _onClose() {
     this.connected = false;
+    this._uptime.onDisconnected();
     clearInterval(this._hbTimer);
+    clearInterval(this._hubTimeoutTimer);
 
-    console.log(chalk.yellow(`  ↓ 与 Hub 断开连接，${this.reconnectMs / 1000}s 后重连...`));
+    console.log(chalk.yellow(`  ↓ 与 Hub 断开，${this.reconnectMs / 1000}s 后重连...`));
 
-    this._reconnTimer = setTimeout(() => {
-      this._connect();
-    }, this.reconnectMs);
+    this._reconnTimer = setTimeout(() => this._connect(), this.reconnectMs);
+    this.reconnectMs  = Math.min(this.reconnectMs * 2, RECONNECT_MAX);
+  }
 
-    // 指数退避，最大 30s
-    this.reconnectMs = Math.min(this.reconnectMs * 2, RECONNECT_MAX);
+  // ── 故障转移：切换到新 Hub ──
+  _switchHub(newHubName) {
+    console.log(chalk.cyan(`  🔄 切换到新 Hub: ${newHubName}`));
+    // 这里需要知道新 Hub 的 URL，约定同端口，只换 host
+    // 实际使用时 nodes_list 中包含了每个节点的 IP
+    const newUrl = this._resolveHubUrl(newHubName);
+    if (!newUrl) {
+      console.log(chalk.red(`  无法解析 ${newHubName} 的地址，等待重连`));
+      return;
+    }
+    this.hubUrl = newUrl;
+    clearTimeout(this._reconnTimer);
+    if (this.ws) this.ws.close();
+    setTimeout(() => this._connect(), 500);
+  }
+
+  // ── 故障转移：我自己升级为 Hub ──
+  _becomeHub() {
+    console.log(chalk.bold.green(`\n  🏆 ${this.name} 升级为临时 Hub\n`));
+    this.emit('become-hub', { name: this.name });
+    // 上层（mesh.js）监听此事件后，启动 Hub 服务并切换角色
+  }
+
+  // 解析节点名 → WS URL（从 nodes_list 缓存中查）
+  _resolveHubUrl(nodeName) {
+    const node = this._knownNodes?.find(n => n.name === nodeName);
+    if (!node?.ip) return null;
+    const port = new URL(this.hubUrl).port || 7700;
+    return `ws://${node.ip}:${port}`;
   }
 
   _setupDefaultHandlers() {
@@ -111,14 +207,14 @@ class Spoke {
     });
 
     this.on(MSG.HEARTBEAT_ACK, () => {
-      // 静默处理心跳响应
+      this._lastHubPong = Date.now();
     });
 
     this.on(MSG.NODES_LIST, (msg) => {
-      const nodes = msg.payload || [];
-      if (nodes.length > 0) {
-        console.log(chalk.gray(`  🌐 当前在线节点: ${nodes.map(n => n.name).join(', ')}`));
-      }
+      // 缓存节点列表（用于故障转移时解析地址）
+      this._knownNodes = msg.payload || [];
+      const names = this._knownNodes.map(n => n.name).join(', ');
+      if (names) console.log(chalk.gray(`  🌐 在线节点: ${names}`));
     });
 
     this.on(MSG.ERROR, (msg) => {
@@ -132,18 +228,10 @@ class Spoke {
   }
 
   // ── 对外 API ──
-
-  /**
-   * 向指定节点或 Hub 发送消息
-   */
   send(to, payload, type = MSG.QUERY, opts = {}) {
     this._send(createMsg(type, this.name, to, payload, opts));
   }
 
-  /**
-   * 流式发送（Agent 边生成边转发）
-   * 调用方负责循环调用 sendChunk，最后调用 sendDone
-   */
   sendChunk(to, chunk, sessionId) {
     this._send(createMsg(MSG.STREAM_CHUNK, this.name, to, chunk, {
       session: sessionId, done: false,
@@ -156,18 +244,19 @@ class Spoke {
     }));
   }
 
-  /**
-   * 注册消息类型处理器
-   */
+  /** 获取本节点在线率（0~1） */
+  getUptimeRate() {
+    return this._uptime.getRate();
+  }
+
   on(type, handler) {
     this._handlers.set(type, handler);
     return this;
   }
 
   emit(type, data) {
-    // 简单事件系统，上层可覆盖
-    const h = this._handlers.get('*');
-    if (h) h({ type, data });
+    const h = this._handlers.get(type);
+    if (h) h(data);
   }
 
   _send(msg) {
@@ -178,7 +267,9 @@ class Spoke {
 
   disconnect() {
     clearInterval(this._hbTimer);
+    clearInterval(this._hubTimeoutTimer);
     clearTimeout(this._reconnTimer);
+    this._uptime.onDisconnected();
     if (this.ws) {
       this._send(createMsg(MSG.DISCONNECT, this.name, 'hub'));
       this.ws.close();
