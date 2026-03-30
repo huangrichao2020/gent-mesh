@@ -33,6 +33,7 @@ class ACPClient {
     this.capabilities = opts.capabilities || [];
     this.tags         = opts.tags || [];
     this.registry     = opts.registry || DEFAULT_REGISTRY;
+    this.token        = opts.token || 'acp-open-beta-2026';
 
     this._serverId    = null;
     this._hbTimer     = null;
@@ -113,8 +114,9 @@ class ACPClient {
         path:     url.pathname,
         method,
         headers:  {
-          'Content-Type':   'application/json',
-          'Content-Length': Buffer.byteLength(body || ''),
+          'Content-Type':      'application/json',
+          'Content-Length':    Buffer.byteLength(body || ''),
+          'X-Registry-Token':  this.token,
         },
       };
 
