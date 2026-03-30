@@ -19,7 +19,8 @@ const cfg     = require('./config/mesh.config');
 const { runDoctor }  = require('./core/doctor');
 const { Hub }        = require('./core/hub');
 const { Spoke }      = require('./core/spoke');
-const { detectHubNetwork, getLocalIPs } = require('./core/detect');
+const { detectHubNetwork, getLocalIPs, checkInternet } = require('./core/detect');
+const { ACPClient, searchACP, DEFAULT_REGISTRY } = require('./core/acp');
 
 const [,, cmd, ...args] = process.argv;
 
@@ -30,6 +31,7 @@ async function main() {
     case 'doctor': return runDoctor();
     case 'nodes':  return runNodes();
     case 'send':   return runSend(args);
+    case 'acp':    return runACP(args);
     default:
       printHelp();
   }
@@ -200,11 +202,21 @@ async function runStart() {
   if (config.role === 'hub') {
     const hub = new Hub(config);
     await hub.start();
-
-    // 保存 token（init 时已存，但确保一致）
     cfg.set('hubToken', hub.token);
 
-    // 优雅退出
+    // 如果配置了 ACP，自动注册
+    if (config.acp?.enabled && config.acp?.capabilities?.length > 0) {
+      const acp = new ACPClient({
+        name:         config.name,
+        description:  config.acp.description,
+        endpoint:     config.acp.endpoint,
+        capabilities: config.acp.capabilities,
+        tags:         config.acp.tags,
+        registry:     config.acp.registry,
+      });
+      await acp.register();
+    }
+
     process.on('SIGINT', () => {
       console.log(chalk.yellow('\n\nHub 正在关闭...'));
       process.exit(0);
@@ -288,13 +300,131 @@ async function runSend([to, ...msgParts]) {
   }
 }
 
+// ──────────────────────────────────────────
+// mesh acp [init|search]
+// ──────────────────────────────────────────
+async function runACP([sub, ...rest]) {
+  if (sub === 'search') return runACPSearch(rest);
+  // default: acp init
+  return runACPInit();
+}
+
+async function runACPInit() {
+  const { default: inquirer } = await import('inquirer').catch(() => ({ default: require('inquirer') }));
+  const iq = require('inquirer');
+
+  console.log(chalk.bold.cyan('\n📡  ACP Server 模式配置\n'));
+
+  // 检测公网 IP
+  const ips = getLocalIPs();
+  const internet = await checkInternet();
+  if (!internet) {
+    console.log(chalk.red('  ❌ 无外网连接，ACP Server 需要公网可访问'));
+    return;
+  }
+
+  console.log(chalk.gray('  本机 IP:'));
+  ips.forEach(i => console.log(chalk.gray(`    ${i.name}: ${i.address}`)));
+
+  const answers = await iq.prompt([
+    {
+      type: 'input',
+      name: 'endpoint',
+      message: '对外 WebSocket 地址（公网 IP + 端口）？',
+      default: `ws://${ips[0]?.address || '0.0.0.0'}:7700`,
+      validate: v => v.startsWith('ws') ? true : '格式应为 ws:// 或 wss://',
+    },
+    {
+      type: 'input',
+      name: 'description',
+      message: '这台 ACP Server 的描述？',
+      default: '我的 Agent 服务器',
+    },
+    {
+      type: 'input',
+      name: 'tags',
+      message: '标签（逗号分隔，如 chinese,code,data）',
+      default: '',
+    },
+    {
+      type: 'confirm',
+      name: 'addCapability',
+      message: '现在添加能力（Capability）定义？',
+      default: true,
+    },
+  ]);
+
+  const capabilities = [];
+  let addMore = answers.addCapability;
+
+  while (addMore) {
+    const cap = await iq.prompt([
+      { type: 'input', name: 'id',          message: '能力 ID（如 run_code）',   validate: v => v ? true : '不能为空' },
+      { type: 'input', name: 'description', message: '能力描述',                 default: '' },
+      { type: 'input', name: 'perMinute',   message: '每分钟限流次数',           default: '30' },
+      { type: 'input', name: 'perDay',      message: '每天限流次数（留空不限）', default: '' },
+      { type: 'list',  name: 'auth',        message: '鉴权方式',
+        choices: [
+          { name: 'none  — 无需鉴权，任何人可调用', value: 'none' },
+          { name: 'token — 需要调用方提供 token',  value: 'token' },
+        ]},
+    ]);
+
+    const rateLimit = { perMinute: parseInt(cap.perMinute) || 30 };
+    if (cap.perDay) rateLimit.perDay = parseInt(cap.perDay);
+
+    capabilities.push({ id: cap.id, description: cap.description, rateLimit, auth: cap.auth });
+
+    const { more } = await iq.prompt([{
+      type: 'confirm', name: 'more', message: '继续添加能力？', default: false,
+    }]);
+    addMore = more;
+  }
+
+  const config = cfg.load() || {};
+  config.acp = {
+    enabled:      true,
+    endpoint:     answers.endpoint,
+    description:  answers.description,
+    tags:         answers.tags ? answers.tags.split(',').map(s => s.trim()).filter(Boolean) : [],
+    capabilities,
+    registry:     DEFAULT_REGISTRY,
+  };
+  cfg.save(config);
+
+  console.log(chalk.bold.green('\n✅  ACP Server 配置已保存'));
+  console.log(chalk.gray('  运行 mesh start 时将自动向根注册服务器注册'));
+  console.log(chalk.gray(`  根注册服务器: ${DEFAULT_REGISTRY}\n`));
+}
+
+async function runACPSearch([query]) {
+  console.log(chalk.cyan(`\n  🔍 搜索 ACP Server: "${query || '全部'}"\n`));
+  try {
+    const result = await searchACP({ q: query, capability: query });
+    if (result.count === 0) {
+      console.log(chalk.gray('  未找到匹配的 ACP Server'));
+    } else {
+      console.log(chalk.bold(`  找到 ${result.count} 个服务器：\n`));
+      result.servers.forEach(s => {
+        console.log(chalk.green(`  ● ${s.name}`) + chalk.gray(`  ${s.endpoint}`));
+        console.log(chalk.gray(`    ${s.description}`));
+        console.log(chalk.gray(`    能力: ${s.capabilities.map(c => c.id || c).join(', ')}\n`));
+      });
+    }
+  } catch (err) {
+    console.error(chalk.red(`  搜索失败: ${err.message}`));
+  }
+}
+
 function printHelp() {
   console.log(chalk.bold('\nagent-mesh — 多设备 Agent 通信网格\n'));
-  console.log('  mesh init      初始化（设置角色、Hub 地址）');
-  console.log('  mesh start     启动（Hub 或 Spoke）');
-  console.log('  mesh doctor    环境检测');
-  console.log('  mesh nodes     查看在线节点');
-  console.log('  mesh send      向节点发送消息');
+  console.log('  mesh init          初始化（设置角色、Hub 地址）');
+  console.log('  mesh start         启动（Hub 或 Spoke）');
+  console.log('  mesh doctor        环境检测');
+  console.log('  mesh nodes         查看在线节点');
+  console.log('  mesh send          向节点发送消息');
+  console.log('  mesh acp           配置 ACP Server 模式（对外开放能力）');
+  console.log('  mesh acp search    搜索公共 ACP Server');
   console.log('');
 }
 
