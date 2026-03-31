@@ -120,6 +120,27 @@ ssh -R 7700:localhost:7700 -R 7701:localhost:7701 root@your-remote-ip -N &
 ws://127.0.0.1:7700
 ```
 
+> **⚠️ 防火墙说明**  
+> 远程设备通常有**两层防火墙**，都需要确保 `7700/7701` 端口通畅：
+>
+> 1. **云服务商网络防火墙** — 阿里云/腾讯云/AWS 等云厂商的安全组规则，需要在控制台添加入站规则
+> 2. **系统防火墙** — Linux 自带的 `firewalld`/`ufw`/`iptables`，需要在系统内开放端口
+>
+> 这两层防火墙都需要**使用者自行配置**，任何一层拦截都会导致连接失败。
+>
+> ```bash
+> # 检查 firewalld 状态
+> systemctl status firewalld
+>
+> # 开放端口（如果使用 firewalld）
+> firewall-cmd --permanent --add-port=7700/tcp
+> firewall-cmd --permanent --add-port=7701/tcp
+> firewall-cmd --reload
+>
+> # 检查端口是否监听
+> netstat -tlnp | grep -E '7700|7701'
+> ```
+
 ---
 
 ## 消息格式 · Message Format
