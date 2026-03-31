@@ -11,6 +11,9 @@
 ## 是什么 · What
 
 一条命令，让你 Mac 上的 Claude 能实时指挥远程设备上的 Qwen，双向流式对话，零延迟。
+目前市场主流的 agent 或者 ai cli 工具都没有考虑到用户手上有多个设备的情况，这个其实是数据链路层面的问题，不是 agent 自身的问题，
+之前我想让眼前的设备操作多台设备，每次都要建立 ssh 通道，把工作手册以文件的形式发给其他设备，其他设备有个 deamon 守护进程轮询读新文件，有新工作来了就 stdin 唤起 qwen claude 等 ai 工具
+用是能用，但是效率很低，还不能知道远程发生了什么事，相当黑盒，所以我基于 ssh 双工通道和 websocekt 设计了这个架构，让两个不同设备上的 agent 实时对话
 
 > One command — your Mac's Claude talks to Qwen on a remote device in real-time, bidirectional streaming.
 
