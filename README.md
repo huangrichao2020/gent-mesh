@@ -10,13 +10,13 @@
 
 ## 是什么 · What
 
-一条命令，让你 Mac 上的 Claude 能实时指挥阿里云上的 Qwen，双向流式对话，零延迟。
+一条命令，让你 Mac 上的 Claude 能实时指挥远程设备上的 Qwen，双向流式对话，零延迟。
 
-> One command — your Mac's Claude talks to your Alibaba Cloud Qwen in real-time, bidirectional streaming.
+> One command — your Mac's Claude talks to Qwen on a remote device in real-time, bidirectional streaming.
 
 ```
 主人的 Mac（Hub · Claude）
-    ├── ← → 阿里云（Spoke · Qwen）    公网 / SSH 反向隧道
+    ├── ← → 远程设备（Spoke · Qwen）    公网 / SSH 反向隧道
     ├── ← → 局域网设备 A（Spoke）      直连
     └── ← → 局域网设备 B（Spoke）      直连
 ```
@@ -48,7 +48,7 @@ node mesh.js start
 # 🔑 Token: hub_xK9mP2...
 ```
 
-### 第二步：Spoke 设备（阿里云 / 局域网其他设备）
+### 第二步：Spoke 设备（远程设备 / 局域网其他设备）
 
 ```bash
 git clone https://github.com/huangrichao2020/agent-mesh
@@ -72,8 +72,8 @@ node mesh.js start
 node mesh.js nodes
 
 # 在线节点 (2)
-#   ● aliyun-qwen  [qwen]  47.x.x.x
-#   ● home-windows [claude] 192.168.1.8
+#   ● remote-qwen    [qwen]  47.x.x.x
+#   ● home-windows   [claude] 192.168.1.8
 ```
 
 ---
@@ -108,15 +108,15 @@ node mesh.js doctor
 
 ---
 
-## 公网 Spoke 连接（阿里云场景）
+## 公网 Spoke 连接（远程设备场景）
 
-阿里云无法主动连入你的 Mac，用 SSH 反向隧道解决：
+远程设备无法主动连入你的 Mac，用 SSH 反向隧道解决：
 
 ```bash
-# 在你的 Mac 上执行（把 Mac 的端口暴露到阿里云）
-ssh -R 7700:localhost:7700 -R 7701:localhost:7701 root@your-aliyun-ip -N &
+# 在你的 Mac 上执行（把 Mac 的端口暴露到远程设备）
+ssh -R 7700:localhost:7700 -R 7701:localhost:7701 root@your-remote-ip -N &
 
-# 然后在阿里云上，Hub 地址填写
+# 然后在远程设备上，Hub 地址填写
 ws://127.0.0.1:7700
 ```
 
